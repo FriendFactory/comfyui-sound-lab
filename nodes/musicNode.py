@@ -1,188 +1,92 @@
-import os,sys,base64
+import os, sys, base64
 import folder_paths
 import numpy as np
-
-import torch,random
+import torch, random
 from comfy.model_management import get_torch_device
 from huggingface_hub import snapshot_download
-
 import torchaudio
-
-
-
-# 获取当前文件的绝对路径
-current_file_path = os.path.abspath(__file__)
-
-# 获取当前文件的目录
-current_directory = os.path.dirname(current_file_path)
-
-# 添加当前插件的nodes路径，使ChatTTS可以被导入使用
-sys.path.append(current_directory)
-
-       
 from scipy.io import wavfile
-import torch
 from transformers import AutoProcessor, MusicgenForConditionalGeneration
-
 from .utils import get_new_counter
 
-
-modelpath=os.path.join(folder_paths.models_dir, "musicgen")
+modelpath = os.path.join(folder_paths.models_dir, "musicgen")
 
 
 def init_audio_model(checkpoint):
-
     audio_processor = AutoProcessor.from_pretrained(checkpoint)
-
     audio_model = MusicgenForConditionalGeneration.from_pretrained(checkpoint)
-
-    # audio_model.to(device)
     audio_model = audio_model.to(torch.device('cpu'))
-
-    # increase the guidance scale to 4.0
     audio_model.generation_config.guidance_scale = 4.0
-
-    # set the max new tokens to 256
-    # 1500 - 30s
     audio_model.generation_config.max_new_tokens = 1500
-
-    # set the softmax sampling temperature to 1.5
     audio_model.generation_config.temperature = 1.5
-
-    return (audio_processor,audio_model)
+    return (audio_processor, audio_model)
 
 
 class MusicNode:
     def __init__(self):
         self.audio_model = None
+
+    class_type = "MusicNode"
+
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-            "prompt": ("STRING", 
-                         {
-                            "multiline": True, 
-                            "default": '',
-                            "dynamicPrompts": True
-                          }),
-            
-            "seconds":("FLOAT", {
-                        "default": 5, 
-                        "min": 1, #Minimum value
-                        "max": 1000, #Maximum value
-                        "step": 0.1, #Slider's step
-                        "display": "number" # Cosmetic only: display as "number" or "slider"
-                    }),
-            "guidance_scale":("FLOAT", {
-                        "default": 4.0, 
-                        "min": 0, #Minimum value
-                        "max": 20, #Maximum value
-                    }),
+            "prompt": ("STRING", {"multiline": True, "default": '', "dynamicPrompts": True}),
+            "seconds": ("FLOAT", {"default": 5, "min": 1, "max": 1000, "step": 0.1, "display": "number"}),
+            "guidance_scale": ("FLOAT", {"default": 4.0, "min": 0, "max": 20}),
+            "seed": ("INT", {"default": 0, "min": 0, "max": np.iinfo(np.int32).max}),
+            "device": (["auto", "cpu"],),
+        }}
 
-            "seed":  ("INT", {"default": 0, "min": 0, "max": np.iinfo(np.int32).max}), 
-
-            "device": (["auto","cpu"],),
-                             },
-
-            
-                }
-    
     RETURN_TYPES = ("AUDIO",)
     RETURN_NAMES = ("audio",)
-
     FUNCTION = "run"
-
     CATEGORY = "♾️Sound Lab"
-
     INPUT_IS_LIST = False
     OUTPUT_IS_LIST = (False,)
-  
-    def run(self,prompt,seconds,guidance_scale,seed,device):
-        
-        if seed==-1:
+
+    def run(self, prompt, seconds, guidance_scale, seed, device):
+        if seed == -1:
             seed = np.random.randint(0, np.iinfo(np.int32).max)
 
-        # Set the seed for reproducibility
         torch.manual_seed(seed)
         random.seed(seed)
         np.random.seed(seed)
 
-      
-        if self.audio_model ==None:
-            
-            if os.path.exists(modelpath)==False:
+        if self.audio_model is None:
+            if not os.path.exists(modelpath):
                 os.mkdir(modelpath)
+            config = os.path.join(modelpath, 'config.json')
+            if not os.path.exists(config):
+                snapshot_download("facebook/musicgen-small", local_dir=modelpath, endpoint='https://hf-mirror.com')
+            self.audio_processor, self.audio_model = init_audio_model(modelpath)
 
-            if os.path.exists(modelpath):
+        inputs = self.audio_processor(text=prompt, padding=True, return_tensors="pt")
 
-                config=os.path.join(modelpath,'config.json')
-                if os.path.exists(config)==False:
-                    snapshot_download("facebook/musicgen-small",
-                                                local_dir=modelpath,
-                                                # local_dir_use_symlinks=False,
-                                                # filename="config.json",
-                                                endpoint='https://hf-mirror.com')
-                
-                self.audio_processor,self.audio_model=init_audio_model(modelpath)
-                
-          
-        inputs = self.audio_processor(
-            text=prompt,
-            # audio=audio,
-            # sampling_rate=sampling_rate,
-            padding=True,
-            return_tensors="pt",
-        )
-
-        if device=='auto':
-            device="cuda" if torch.cuda.is_available() else "cpu"
+        if device == 'auto':
+            device = "cuda" if torch.cuda.is_available() else "cpu"
 
         self.audio_model.to(torch.device(device))
 
-        # max_tokens=256 #default=5, le=30
-        # if duration:
-        #     max_tokens=int(duration*50)
-
-        # seconds = 10  # 例如，用户输入的秒数
         tokens_per_second = 1500 / 30
         max_tokens = int(tokens_per_second * seconds)
 
-
         sampling_rate = self.audio_model.config.audio_encoder.sampling_rate
-        # input_audio
-        audio_values = self.audio_model.generate(**inputs.to(device), 
-                    do_sample=True, 
-                    guidance_scale=guidance_scale, 
-                    max_new_tokens=max_tokens,
-                    )
-        
+        audio_values = self.audio_model.generate(
+            **inputs.to(device),
+            do_sample=True,
+            guidance_scale=guidance_scale,
+            max_new_tokens=max_tokens,
+        )
+
         self.audio_model.to(torch.device('cpu'))
 
-        audio=audio_values[0, 0].cpu().numpy()
-
-        output_dir = folder_paths.get_output_directory()
-    
-        audio_file="music_gen"
-        counter=get_new_counter(output_dir,audio_file)
-        # print('#audio_path',folder_paths, )
-        # 添加文件名后缀
-        audio_file = f"{audio_file}_{counter:05}.wav"
-        
-        audio_path=os.path.join(output_dir, audio_file)
- 
-        # save the best audio sample (index 0) as a .wav file
-        wavfile.write(audio_path, rate=sampling_rate, data=audio)
-
-        # with open(audio_path, "rb") as audio_file:
-        #     audio_data = audio_file.read()
-        #     audio_base64 = f'data:audio/wav;base64,'+base64.b64encode(audio_data).decode("utf-8")
+        audio = audio_values[0].unsqueeze(0).cpu()
 
         return ({
-                "filename": audio_file,
-                "subfolder": "",
-                "type": "output",
-                "prompt":prompt
+                    "waveform": audio,
+                    "sample_rate": sampling_rate
                 },)
-    
 
 
 class AudioPlayNode:
@@ -191,78 +95,42 @@ class AudioPlayNode:
         self.type = "temp"
         self.prefix_append = ""
         self.compress_level = 4
+
+    class_type = "AudioPlayNode"
+
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
             "audio": ("AUDIO",),
-              }, 
-                }
-    
+        }}
+
     RETURN_TYPES = ()
-  
     FUNCTION = "run"
-
     CATEGORY = "♾️Mixlab/Audio"
-
     INPUT_IS_LIST = False
     OUTPUT_IS_LIST = ()
-
     OUTPUT_NODE = True
-  
-    def run(self,audio):
 
-        # 判断是否是 Tensor 类型
-        is_tensor = not isinstance(audio, dict)
-        print('#判断是否是 Tensor 类型',is_tensor,audio)
-        if not is_tensor and 'waveform' in audio and 'sample_rate' in audio:
-            # {'waveform': tensor([], size=(1, 1, 0)), 'sample_rate': 44100}
-            is_tensor=True
+    def run(self, audio):
+        filename_prefix = self.prefix_append
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
+            filename_prefix, self.output_dir)
+        filename_with_batch_num = filename.replace("%batch_num%", str(1))
+        file = f"{filename_with_batch_num}_{counter:05}_.wav"
 
-        if is_tensor:
-            filename_prefix=""
-            # 保存
-            filename_prefix += self.prefix_append
-            full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, self.output_dir)
-            results = list()
-            
-            filename_with_batch_num = filename.replace("%batch_num%", str(1))
-            file = f"{filename_with_batch_num}_{counter:05}_.wav"
-            
-            torchaudio.save(os.path.join(full_output_folder, file), audio['waveform'].squeeze(0), audio["sample_rate"])
-            results.append({
-                    "filename": file,
-                    "subfolder": subfolder,
-                    "type": self.type
-                })
-            
-        else:
-            results=[audio]
-                
+        waveform = audio['waveform']
+        if waveform.ndim == 3:
+            waveform = waveform.squeeze(0)
+        elif waveform.ndim == 1:
+            waveform = waveform.unsqueeze(0)
 
-        # print(audio)
-        return {"ui": {"audio":results}}
-
-#todo
-# class LoadAudioNode:
-
-#     @classmethod
-#     def INPUT_TYPES(s):
-#         return {"required": {
-#                     "audio": ("AUDIO",),
-#               }, 
-#                 }
-    
-#     RETURN_TYPES = ()
-  
-#     FUNCTION = "run"
-
-#     CATEGORY = "♾️Sound Lab"
-
-#     INPUT_IS_LIST = False
-#     OUTPUT_IS_LIST = ()
-
-#     OUTPUT_NODE = True
-  
-#     def run(self,audio):
-#         # print(audio)
-#         return {"ui": {"audio":[audio]}}
+        torchaudio.save(
+            os.path.join(full_output_folder, file),
+            waveform,
+            audio["sample_rate"]
+        )
+        return {"ui": {"audio": [{
+            "filename": file,
+            "subfolder": subfolder,
+            "type": self.type
+        }]}}
